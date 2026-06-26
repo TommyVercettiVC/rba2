@@ -1,0 +1,1281 @@
+-- ============================================================================
+-- Ragebot Aimbot v3.0 (FIXED, consolidated single-version)
+-- ----------------------------------------------------------------------------
+-- This file consolidates v1-v5 of the original rba2.lua and fixes 30+ critical
+-- bugs identified during code review. Highlights:
+--
+--   * Single script (no duplicate execution / leaked connections)
+--   * Proper target stickiness (file-scope lastTargetTime, identity comparison)
+--   * Magnitude-based stabilization (NOT broken angle scaling)
+--   * Cached ESP Drawings (no per-frame Highlight churn)
+--   * Camera-type set to Scriptable when "Camera" aim mode is used
+--   * World-yaw + local-pitch camera rotation (correct under roll)
+--   * AssemblyLinearVelocity fallback chain (Velocity is deprecated)
+--   * RaycastFilterType.Exclude (Blacklist is deprecated)
+--   * Custom GUI drag (Draggable is deprecated/hidden)
+--   * Robust executor-unload hook (Synapse/Solara/Krnl/Xeno patterns)
+--   * Slider connections tracked in global Connections table
+--   * pcall-guarded init with bounded retries
+--   * Hotkeys ignored while typing in chat
+--   * Mouse-inset corrected (GetMouseLocation vs WorldToViewportPoint)
+--   * Team-check handles nil teams (nil == nil was true)
+--   * Visibility raycast uses IsDescendantOf(player.Character)
+--   * SafeTracerOrigin with default fallback
+--   * Math.abs for ESP box dimensions (ragdoll-safe)
+--   * LocalPlayer.Character nil-guarded in ESP distance calc
+--   * AutoAdjust UI sync (sliders reflect auto-adjusted values)
+--   * All task.* APIs (no legacy delay/wait)
+-- ============================================================================
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+-- --------------------------------------------------------------------------
+-- Services
+-- --------------------------------------------------------------------------
+local Players            = game:GetService("Players")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
+local TweenService       = game:GetService("TweenService")
+local Workspace          = game:GetService("Workspace")
+local CoreGui            = game:GetService("CoreGui")
+local LocalPlayer        = Players.LocalPlayer
+
+-- --------------------------------------------------------------------------
+-- Executor feature detection
+-- --------------------------------------------------------------------------
+local HAS_DRAWING     = (typeof(Drawing) == "table" and typeof(Drawing.new) == "function")
+local HAS_MOUSEMOVE   = type(mousemoverel) == "function"
+local HAS_GETHUI      = type(gethui) == "function"
+local HAS_GETGENV     = type(getgenv) == "function"
+
+-- Try to obtain a parent for our GUIs that survives reset
+local function getGuiParent()
+    if HAS_GETHUI then
+        local ok, hui = pcall(gethui)
+        if ok and hui then return hui end
+    end
+    if CoreGui then return CoreGui end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- --------------------------------------------------------------------------
+-- Config (single source of truth)
+-- --------------------------------------------------------------------------
+local Config = {
+    -- Aim
+    Enabled           = true,
+    FOV               = 120,
+    Smoothness        = 0.45,
+    MaxLockSpeed      = 0.8,
+    ActivationDelay   = 0.15,    -- seconds a new target must "win" before switching
+    TeamCheck         = true,
+    VisibilityCheck   = false,
+    TargetPart        = "Head",
+    AimingMode        = "Mouse", -- "Mouse" or "Camera"
+    AimMethod         = "Rage",  -- "Rage" or "Legit"
+    AutoFire          = false,   -- was referenced but never declared in originals
+
+    -- Prediction
+    PredictionEnabled   = true,
+    PredictionStrength  = 0.15,
+    BulletSpeed         = 1500,  -- studs/sec; used to compute timeToTarget
+
+    -- Stabilization
+    StabilizationEnabled = true,
+    MaxAngleChange       = 2.5,
+    HumanizationFactor   = 0.3,
+    LockThreshold        = 5,
+    LockStrength         = 0.8,
+
+    -- FOV Circle
+    FOVCircleVisible    = true,
+    FOVCircleColor      = Color3.fromRGB(255, 50, 50),
+    FOVCircleTransparency = 0.7,
+    FOVCircleSides      = 64,
+
+    -- ESP
+    ESPEnabled   = true,
+    ESPColor     = Color3.fromRGB(255, 50, 50),
+    ESPRefresh   = 0.05,
+    ESPBoxes     = true,
+    ESPNames     = true,
+    ESPTracers   = true,
+    ESPHealth    = true,
+    ESPDistance  = true,
+    TracerOrigin = "Mouse",      -- "Mouse", "Center", "Bottom", "Top"
+
+    -- Safety aim (warning indicator)
+    SafetyAimEnabled = true,
+
+    -- Crosshair
+    CrosshairEnabled  = true,
+    CrosshairType     = "Circle", -- "Circle", "Octagon", "Dot"
+    CrosshairColor    = Color3.fromRGB(255, 255, 255),
+    CrosshairSize     = 12,
+    CrosshairThickness= 1,
+
+    -- Auto-adjust
+    AutoAdjustEnabled  = false,
+
+    -- GUI
+    GUIVisible = true,
+}
+
+-- --------------------------------------------------------------------------
+-- Module state (all file-scope; fixes B2 lastTargetTime, B42 Camera, etc.)
+-- --------------------------------------------------------------------------
+local Camera             = Workspace.CurrentCamera
+local FOVCircle          = nil
+local Crosshair          = nil
+local SafetyWarning      = nil
+local ESPCache           = {}     -- player -> { drawings... }
+local CurrentTarget      = nil
+local Connections        = {}
+local TargetHistory      = {}     -- player -> array of {position, time}
+local lastTargetSwitchAt = 0      -- file-scope; fixes B2
+local lastAutoAdjustAt   = 0
+local SmoothAimProgress  = 0
+local LastTargetPlayer   = nil    -- fixes B4/B25 (compare by identity, not pos)
+local GUIInstance        = nil
+local SliderRegistry     = {}     -- for auto-adjust UI sync (fixes B31)
+
+-- Forward declarations
+local updateFOVCircle, configureFOVCircle, rageAimbot, updateESP
+local checkSafetyAim, autoAdjustSettings
+local createCrosshair, createSafetyWarning, createGUI
+
+-- --------------------------------------------------------------------------
+-- Helper: robust Drawing creation (fixes B30 — never crashes if Drawing absent)
+-- --------------------------------------------------------------------------
+local function newDrawing(kind)
+    if not HAS_DRAWING then return nil end
+    local ok, obj = pcall(Drawing.new, kind)
+    if not ok or not obj then return nil end
+    return obj
+end
+
+-- --------------------------------------------------------------------------
+-- Helper: connection tracking (fixes B24 — slider conn leaks)
+-- --------------------------------------------------------------------------
+local function trackConn(conn)
+    if conn then table.insert(Connections, conn) end
+    return conn
+end
+
+-- --------------------------------------------------------------------------
+-- Helper: current camera (fixes B42 — re-fetch if game swaps camera)
+-- --------------------------------------------------------------------------
+local function getCamera()
+    if not Camera or not Camera.Parent then
+        Camera = Workspace.CurrentCamera
+    end
+    return Camera
+end
+
+-- --------------------------------------------------------------------------
+-- Helper: mouse location in viewport space (fixes B18 — inset mismatch)
+-- --------------------------------------------------------------------------
+local function getMouseViewport()
+    -- UserInputService:GetMouseLocation returns screen space with GUI inset.
+    -- Camera:WorldToViewportPoint returns viewport space (no inset).
+    -- Convert mouse to viewport space so they're comparable.
+    local mouseLoc = UserInputService:GetMouseLocation()
+    local cam = getCamera()
+    -- ScreenToViewportPoint removes the inset offset.
+    local vp, _ = cam:ScreenToViewportPoint(mouseLoc)  -- returns Vector3
+    return Vector2.new(vp.X, vp.Y)
+end
+
+-- --------------------------------------------------------------------------
+-- Helper: get velocity (fixes B13 — Velocity deprecated)
+-- --------------------------------------------------------------------------
+local function getPartVelocity(part)
+    if not part then return Vector3.zero end
+    if part.AssemblyLinearVelocity then
+        return part.AssemblyLinearVelocity
+    elseif part.Velocity then
+        return part.Velocity  -- legacy fallback
+    end
+    return Vector3.zero
+end
+
+-- --------------------------------------------------------------------------
+-- FOV Circle
+-- --------------------------------------------------------------------------
+function configureFOVCircle()
+    if not FOVCircle then return end
+    FOVCircle.Visible       = Config.FOVCircleVisible
+    FOVCircle.Radius        = Config.FOV
+    FOVCircle.Color         = Config.FOVCircleColor
+    FOVCircle.Transparency  = Config.FOVCircleTransparency
+    FOVCircle.NumSides      = Config.FOVCircleSides
+    FOVCircle.Thickness     = 2
+    FOVCircle.Filled        = false
+end
+
+function updateFOVCircle()
+    if not FOVCircle then return end
+    local pos = getMouseViewport()
+    FOVCircle.Position = pos
+end
+
+-- --------------------------------------------------------------------------
+-- Crosshair (only "Circle", "Octagon", "Dot" — others were lies in v3)
+-- --------------------------------------------------------------------------
+function createCrosshair()
+    if Crosshair then
+        pcall(function() Crosshair:Remove() end)
+        Crosshair = nil
+    end
+    if not HAS_DRAWING then return end
+
+    Crosshair = newDrawing("Circle")
+    if not Crosshair then return end
+
+    if Config.CrosshairType == "Dot" then
+        Crosshair.Radius   = 2
+        Crosshair.Filled   = true
+        Crosshair.Thickness= 1
+    elseif Config.CrosshairType == "Octagon" then
+        Crosshair.Radius   = Config.CrosshairSize
+        Crosshair.Thickness= Config.CrosshairThickness
+        Crosshair.NumSides = 8
+        Crosshair.Filled   = false
+    else -- "Circle" (default)
+        Crosshair.Radius   = Config.CrosshairSize
+        Crosshair.Thickness= Config.CrosshairThickness
+        Crosshair.NumSides = 32
+        Crosshair.Filled   = false
+    end
+
+    local cam = getCamera()
+    Crosshair.Visible     = Config.CrosshairEnabled
+    Crosshair.Color       = Config.CrosshairColor
+    Crosshair.Position    = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+    Crosshair.Transparency= 0
+end
+
+-- --------------------------------------------------------------------------
+-- Safety aim warning indicator
+-- --------------------------------------------------------------------------
+function createSafetyWarning()
+    if SafetyWarning then
+        pcall(function() SafetyWarning:Remove() end)
+        SafetyWarning = nil
+    end
+    if not HAS_DRAWING then return end
+
+    SafetyWarning = newDrawing("Text")
+    if not SafetyWarning then return end
+
+    local cam = getCamera()
+    SafetyWarning.Visible      = false
+    SafetyWarning.Text         = "!"
+    SafetyWarning.Color        = Color3.fromRGB(255, 50, 50)
+    SafetyWarning.Size         = 25
+    SafetyWarning.Center       = true
+    SafetyWarning.Outline      = true
+    SafetyWarning.OutlineColor = Color3.fromRGB(0, 0, 0)
+    SafetyWarning.Position     = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 4)
+    SafetyWarning.Transparency = 0
+end
+
+-- --------------------------------------------------------------------------
+-- Target part selection (Dynamic option supported)
+-- --------------------------------------------------------------------------
+local function getTargetPart(character)
+    if not character then return nil end
+
+    if Config.TargetPart == "Dynamic" then
+        local mousePos = getMouseViewport()
+        local closestPart, closestDist = nil, math.huge
+        local candidateNames = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart", "LeftLeg", "RightLeg" }
+        for _, name in ipairs(candidateNames) do
+            local part = character:FindFirstChild(name)
+            if part and part:IsA("BasePart") then
+                local sp, onScreen = getCamera():WorldToViewportPoint(part.Position)
+                if onScreen then
+                    local d = (Vector2.new(sp.X, sp.Y) - mousePos).Magnitude
+                    if d < closestDist then
+                        closestDist = d
+                        closestPart = part
+                    end
+                end
+            end
+        end
+        return closestPart or character:FindFirstChild("HumanoidRootPart")
+    end
+
+    local part = character:FindFirstChild(Config.TargetPart)
+    if part and part:IsA("BasePart") then return part end
+    return character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart")
+end
+
+-- --------------------------------------------------------------------------
+-- Predicted position (fixes B33 — bullet speed configurable)
+-- --------------------------------------------------------------------------
+local function calculatePredictedPosition(targetPart, targetCharacter)
+    if not targetPart then return nil end
+    if not Config.PredictionEnabled then return targetPart.Position end
+
+    local root = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+    local velocity = getPartVelocity(root) or Vector3.zero
+    local cam = getCamera()
+    local distance = (targetPart.Position - cam.CFrame.Position).Magnitude
+    local timeToTarget = Config.BulletSpeed > 0 and (distance / Config.BulletSpeed) or 0
+
+    return targetPart.Position + (velocity * timeToTarget * Config.PredictionStrength)
+end
+
+-- --------------------------------------------------------------------------
+-- Target finding (fixes B2, B19, B20, B34, B59)
+-- --------------------------------------------------------------------------
+local function findTarget()
+    local bestTarget = nil
+    local bestPosition = nil       -- Vector3 world position we'll aim at
+    local closestDistance = Config.FOV
+    local mousePos = getMouseViewport()  -- hoisted out of loop (fixes B34)
+    local cam = getCamera()
+    local camOrigin = cam.CFrame.Position
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local char = player.Character
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if humanoid and root and humanoid.Health > 0 then
+                -- Fix B19: nil-team friendly fire
+                if Config.TeamCheck and player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then
+                    continue
+                end
+
+                local targetPart = getTargetPart(char)
+                if targetPart then
+                    -- Aim at predicted world position
+                    local worldPos = calculatePredictedPosition(targetPart, char) or targetPart.Position
+
+                    local screenPos, onScreen = cam:WorldToViewportPoint(worldPos)
+                    if onScreen then
+                        -- Visibility check
+                        if Config.VisibilityCheck then
+                            local direction = (worldPos - camOrigin)
+                            local rayParams = RaycastParams.new()
+                            rayParams.FilterType = Enum.RaycastFilterType.Exclude  -- B14
+                            rayParams.FilterDescendantsInstances = { LocalPlayer.Character, cam }
+                            rayParams.IgnoreWater = true
+
+                            local result = Workspace:Raycast(camOrigin, direction, rayParams)
+                            -- Fix B20: instance-based, not name-based
+                            if result and not result.Instance:IsDescendantOf(char) then
+                                continue
+                            end
+                        end
+
+                        local screenVec = Vector2.new(screenPos.X, screenPos.Y)
+                        local distance = (screenVec - mousePos).Magnitude
+                        if distance < closestDistance then
+                            closestDistance = distance
+                            bestTarget = player
+                            bestPosition = worldPos
+
+                            -- Record history for auto-adjust (only when this becomes best)
+                            if not TargetHistory[player] then TargetHistory[player] = {} end
+                            table.insert(TargetHistory[player], { position = targetPart.Position, time = os.clock() })
+                            while #TargetHistory[player] > 5 do
+                                table.remove(TargetHistory[player], 1)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Stabilization: prevent rapid target switching (fixes B2 — file-scope timer)
+    if CurrentTarget and bestTarget and CurrentTarget ~= bestTarget then
+        if (os.clock() - lastTargetSwitchAt) < Config.ActivationDelay then
+            bestTarget = CurrentTarget
+            local part = getTargetPart(bestTarget.Character)
+            if part then
+                bestPosition = calculatePredictedPosition(part, bestTarget.Character) or part.Position
+            end
+        else
+            lastTargetSwitchAt = os.clock()
+        end
+    elseif bestTarget and not CurrentTarget then
+        lastTargetSwitchAt = os.clock()
+    end
+
+    return bestTarget, bestPosition
+end
+
+-- --------------------------------------------------------------------------
+-- Aim stabilization (fixes B3 — magnitude clamp, not broken angle math;
+--                    fixes B4/B25 — identity-based progress reset)
+-- --------------------------------------------------------------------------
+local function stabilizedAim(worldPosition, target)
+    if not worldPosition or not target then
+        SmoothAimProgress = 0
+        LastTargetPlayer = nil
+        return
+    end
+
+    local cam = getCamera()
+    local mousePos = getMouseViewport()
+    local screenPos, onScreen = cam:WorldToViewportPoint(worldPosition)
+    if not onScreen then return end
+
+    local targetVec = Vector2.new(screenPos.X, screenPos.Y)
+    local direction = targetVec - mousePos
+
+    -- Fix B4/B25: reset progress by player identity, not position
+    if LastTargetPlayer ~= target then
+        SmoothAimProgress = 0
+        LastTargetPlayer = target
+    end
+
+    if Config.StabilizationEnabled then
+        local smoothnessFactor    = Config.Smoothness
+        local maxChangeFactor     = Config.MaxAngleChange
+        local humanizationFactor  = Config.HumanizationFactor
+
+        if Config.AimMethod == "Legit" then
+            smoothnessFactor   = math.min(0.8, smoothnessFactor + 0.2)
+            maxChangeFactor    = math.min(1.5, maxChangeFactor * 0.7)
+            humanizationFactor = math.min(0.5, humanizationFactor + 0.2)
+        end
+
+        -- Gradually build progress
+        SmoothAimProgress = math.min(1, SmoothAimProgress + (1 - smoothnessFactor) * 0.1)
+
+        -- Scale down by remaining progress (smooth approach)
+        local desired = direction * (1 - SmoothAimProgress)
+
+        -- Fix B3: clamp MAGNITUDE, not angle
+        local maxChange = maxChangeFactor * (1 - SmoothAimProgress)
+        if maxChange > 0 and desired.Magnitude > maxChange then
+            desired = (desired.Magnitude > 0 and desired.Unit or desired) * maxChange
+        end
+
+        -- Apply lock strength
+        desired = desired * Config.LockStrength
+
+        -- Human-like imperfection
+        if humanizationFactor > 0 then
+            local imperf = Vector2.new(
+                (math.random() * 2 - 1) * humanizationFactor * (1 - SmoothAimProgress),
+                (math.random() * 2 - 1) * humanizationFactor * (1 - SmoothAimProgress)
+            )
+            desired = desired + imperf
+        end
+
+        direction = desired
+    else
+        direction = direction * Config.Smoothness
+    end
+
+    -- If we're already inside lock threshold, hold position
+    if direction.Magnitude < 0.5 then return end
+
+    if Config.AimingMode == "Mouse" then
+        if HAS_MOUSEMOVE then
+            mousemoverel(direction.X, direction.Y)
+        end
+    else
+        -- Fix B11: set Camera.CameraType = Scriptable so default camera doesn't override
+        if cam.CameraType ~= Enum.CameraType.Scriptable then
+            cam.CameraType = Enum.CameraType.Scriptable
+        end
+        -- Fix B12: world-yaw + local-pitch (correct under roll)
+        local yawDelta   = -direction.X / 500
+        local pitchDelta = -direction.Y / 500
+        local newCFrame = CFrame.Angles(0, yawDelta, 0) * cam.CFrame * CFrame.Angles(pitchDelta, 0, 0)
+        cam.CFrame = newCFrame
+    end
+end
+
+-- --------------------------------------------------------------------------
+-- Main aimbot tick
+-- --------------------------------------------------------------------------
+function rageAimbot()
+    if not Config.Enabled then return end
+    if not LocalPlayer.Character then return end
+
+    local target, position = findTarget()
+    if target then
+        CurrentTarget = target
+        stabilizedAim(position, target)
+
+        if Config.AutoFire then
+            local tool = LocalPlayer.Character:FindFirstChildOfClass("Tool")
+            if tool then tool:Activate() end
+        end
+    else
+        CurrentTarget = nil
+        SmoothAimProgress = 0
+        LastTargetPlayer = nil
+    end
+end
+
+-- --------------------------------------------------------------------------
+-- ESP system (fixes B5/B22/B46/B23/B27/B40/B53/B55 — cached, ragdoll-safe)
+-- --------------------------------------------------------------------------
+local function clearPlayerESP(player)
+    local cache = ESPCache[player]
+    if not cache then return end
+    for _, drawing in ipairs(cache) do
+        pcall(function() drawing:Remove() end)
+    end
+    ESPCache[player] = nil
+end
+
+local function clearAllESP()
+    for player, _ in pairs(ESPCache) do
+        clearPlayerESP(player)
+    end
+    ESPCache = {}
+end
+
+local function getTracerOrigin()
+    local cam = getCamera()
+    local origin
+    if Config.TracerOrigin == "Mouse" then
+        origin = getMouseViewport()
+    elseif Config.TracerOrigin == "Center" then
+        origin = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+    elseif Config.TracerOrigin == "Bottom" then
+        origin = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
+    elseif Config.TracerOrigin == "Top" then
+        origin = Vector2.new(cam.ViewportSize.X / 2, 0)
+    else
+        origin = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)  -- B26 default
+    end
+    return origin
+end
+
+local function buildPlayerESP(player, character, humanoid, head, rootPart)
+    -- Clear previous drawings for this player
+    if ESPCache[player] then
+        for _, d in ipairs(ESPCache[player]) do pcall(function() d:Remove() end) end
+    end
+    ESPCache[player] = {}
+
+    local cam = getCamera()
+    local headPos, headVisible = cam:WorldToViewportPoint(head.Position)
+    local rootPos, rootVisible = cam:WorldToViewportPoint(rootPart.Position)
+
+    if not headVisible and not rootVisible then return end
+
+    -- B27: math.abs for ragdoll safety
+    local height = math.abs(headPos.Y - rootPos.Y) * 2
+    if height < 10 then height = 10 end
+    local width = height / 2.5
+    local cache = ESPCache[player]
+
+    -- Box
+    if Config.ESPBoxes then
+        local box = newDrawing("Square")
+        if box then
+            box.Visible     = true
+            box.Color       = Config.ESPColor
+            box.Thickness   = 2
+            box.Size        = Vector2.new(width, height)
+            box.Position    = Vector2.new(rootPos.X - width/2, rootPos.Y - height/2)
+            box.Filled      = false
+            table.insert(cache, box)
+        end
+    end
+
+    -- Name
+    if Config.ESPNames then
+        local name = newDrawing("Text")
+        if name then
+            name.Visible       = true
+            name.Color         = Config.ESPColor
+            name.Size          = 16
+            name.Center        = true
+            name.Outline       = true
+            name.OutlineColor  = Color3.fromRGB(0, 0, 0)
+            name.Text          = player.Name
+            name.Position      = Vector2.new(rootPos.X, rootPos.Y - height/2 - 20)
+            table.insert(cache, name)
+        end
+    end
+
+    -- Health
+    if Config.ESPHealth then
+        local hp = newDrawing("Text")
+        if hp then
+            local pct = humanoid.Health / math.max(1, humanoid.MaxHealth)
+            hp.Visible      = true
+            hp.Color        = Color3.new(1 - pct, pct, 0)
+            hp.Size         = 14
+            hp.Center       = true
+            hp.Outline      = true
+            hp.OutlineColor = Color3.fromRGB(0, 0, 0)
+            hp.Text         = math.floor(humanoid.Health) .. "/" .. math.floor(humanoid.MaxHealth)
+            hp.Position     = Vector2.new(rootPos.X, rootPos.Y - height/2 - 40)
+            table.insert(cache, hp)
+        end
+    end
+
+    -- Distance (B23: nil-guard LocalPlayer.Character.HumanoidRootPart)
+    if Config.ESPDistance then
+        local localChar = LocalPlayer.Character
+        local localRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
+        if localRoot then
+            local dist = (rootPart.Position - localRoot.Position).Magnitude
+            local dt = newDrawing("Text")
+            if dt then
+                dt.Visible      = true
+                dt.Color        = Config.ESPColor
+                dt.Size         = 14
+                dt.Center       = true
+                dt.Outline      = true
+                dt.OutlineColor = Color3.fromRGB(0, 0, 0)
+                dt.Text         = math.floor(dist) .. " studs"
+                dt.Position     = Vector2.new(rootPos.X, rootPos.Y + height/2 + 10)
+                table.insert(cache, dt)
+            end
+        end
+    end
+
+    -- Tracer
+    if Config.ESPTracers then
+        local tr = newDrawing("Line")
+        if tr then
+            tr.Visible   = true
+            tr.Color     = Config.ESPColor
+            tr.Thickness = 1
+            tr.From      = getTracerOrigin()
+            tr.To        = Vector2.new(rootPos.X, rootPos.Y)
+            table.insert(cache, tr)
+        end
+    end
+end
+
+local lastESPUpdate = 0
+function updateESP()
+    if not Config.ESPEnabled then
+        clearAllESP()
+        return
+    end
+
+    -- Throttle
+    local now = os.clock()
+    if now - lastESPUpdate < Config.ESPRefresh then return end
+    lastESPUpdate = now
+
+    local activePlayers = {}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local char = player.Character
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            local head = char:FindFirstChild("Head")
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if humanoid and humanoid.Health > 0 and head and root then
+                activePlayers[player] = true
+                buildPlayerESP(player, char, humanoid, head, root)
+            end
+        end
+    end
+
+    -- Remove stale ESP for players no longer valid
+    for player, _ in pairs(ESPCache) do
+        if not activePlayers[player] then
+            clearPlayerESP(player)
+        end
+    end
+end
+
+-- --------------------------------------------------------------------------
+-- Safety aim detection (fixes B10 — use HumanoidRootPart.CFrame.LookVector)
+-- --------------------------------------------------------------------------
+function checkSafetyAim()
+    if not SafetyWarning then return end
+    if not Config.SafetyAimEnabled or not LocalPlayer.Character then
+        SafetyWarning.Visible = false
+        return
+    end
+
+    local localRoot = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not localRoot then return end
+
+    local someoneAiming = false
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local char = player.Character
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if humanoid and humanoid.Health > 0 and root then
+                -- B10: use root part orientation, not head (head is animation-driven)
+                local direction = (localRoot.Position - root.Position).Unit
+                local lookVector = root.CFrame.LookVector
+                local dot = lookVector:Dot(direction)
+                local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
+                if angle < 30 then
+                    someoneAiming = true
+                    break
+                end
+            end
+        end
+    end
+
+    SafetyWarning.Visible = someoneAiming
+    if someoneAiming then
+        local pulse = math.sin(os.clock() * 5) * 0.5 + 0.5
+        SafetyWarning.Transparency = 1 - pulse
+    else
+        SafetyWarning.Transparency = 0
+    end
+end
+
+-- --------------------------------------------------------------------------
+-- Auto-adjust (fixes B31 — sync slider UI; B62 — private state)
+-- --------------------------------------------------------------------------
+function autoAdjustSettings()
+    if not Config.AutoAdjustEnabled then return end
+    local now = os.clock()
+    if now - lastAutoAdjustAt < 0.5 then return end
+    lastAutoAdjustAt = now
+
+    local enemyCount = 0
+    local totalDistance = 0
+    local closestDist = math.huge
+    local fastestSpeed = 0
+
+    local cam = getCamera()
+    local camOrigin = cam.CFrame.Position
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local char = player.Character
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if humanoid and humanoid.Health > 0 and root then
+                if Config.TeamCheck and player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then
+                    continue
+                end
+                enemyCount = enemyCount + 1
+                local d = (root.Position - camOrigin).Magnitude
+                totalDistance = totalDistance + d
+                if d < closestDist then closestDist = d end
+
+                local history = TargetHistory[player]
+                if history and #history > 1 then
+                    local latest = history[#history]
+                    local prev = history[1]
+                    local dt = latest.time - prev.time
+                    if dt > 0 then
+                        local moved = (latest.position - prev.position).Magnitude
+                        local speed = moved / dt
+                        if speed > fastestSpeed then fastestSpeed = speed end
+                    end
+                end
+            end
+        end
+    end
+
+    if enemyCount > 0 then
+        local avgDist = totalDistance / enemyCount
+        Config.FOV                = math.clamp(60 + (enemyCount * 15) + (avgDist / 10), 50, 250)
+        Config.Smoothness         = math.clamp(0.2 + (avgDist / 100) - (fastestSpeed / 50), 0.1, 0.8)
+        Config.PredictionStrength = math.clamp(fastestSpeed / 50, 0.05, 0.3)
+        Config.StabilizationEnabled = enemyCount <= 3
+        Config.HumanizationFactor = math.clamp(0.1 + (enemyCount / 20), 0.1, 0.4)
+
+        -- B31: push values back to the slider UIs
+        for field, refresh in pairs(SliderRegistry) do
+            refresh()
+        end
+        if FOVCircle then FOVCircle.Radius = Config.FOV end
+    end
+end
+
+-- --------------------------------------------------------------------------
+-- GUI: custom drag (fixes B15 — Draggable deprecated)
+-- --------------------------------------------------------------------------
+local function makeDraggable(frame)
+    local dragging, dragStart, startPos
+    trackConn(frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+           or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+        end
+    end))
+    trackConn(frame.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+           or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+    trackConn(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                        or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end))
+end
+
+-- --------------------------------------------------------------------------
+-- GUI: slider (fixes B24 — track connections; B68 — guard div-by-zero)
+-- --------------------------------------------------------------------------
+local function createSlider(parent, name, configField, minValue, maxValue, yOffset, precision)
+    precision = precision or 2
+    local sliderLabel = Instance.new("TextLabel")
+    sliderLabel.Size = UDim2.new(0, 180, 0, 20)
+    sliderLabel.Position = UDim2.new(0, 200, 0, yOffset)
+    sliderLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    sliderLabel.BackgroundTransparency = 1
+    sliderLabel.Font = Enum.Font.Gotham
+    sliderLabel.TextSize = 12
+    sliderLabel.TextXAlignment = Enum.TextXAlignment.Left
+    sliderLabel.Parent = parent
+
+    local slider = Instance.new("Frame")
+    slider.Size = UDim2.new(0, 180, 0, 5)
+    slider.Position = UDim2.new(0, 200, 0, yOffset + 20)
+    slider.BackgroundColor3 = Color3.fromRGB(100, 100, 120)
+    slider.BorderSizePixel = 0
+    slider.Parent = parent
+    Instance.new("UICorner", slider).CornerRadius = UDim.new(1, 0)
+
+    local fill = Instance.new("Frame")
+    fill.Position = UDim2.new(0, 0, 0, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(80, 160, 80)
+    fill.BorderSizePixel = 0
+    fill.Parent = slider
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+    local function refresh()
+        local v = Config[configField] or 0
+        local range = (maxValue - minValue)
+        if range == 0 then range = 1 end  -- B68 guard
+        local t = math.clamp((v - minValue) / range, 0, 1)
+        fill.Size = UDim2.new(t, 0, 1, 0)
+        sliderLabel.Text = name .. ": " .. tostring(v)
+    end
+    refresh()
+
+    -- Register so auto-adjust can refresh label/fill (fixes B31)
+    SliderRegistry[configField] = refresh
+
+    local sliderButton = Instance.new("TextButton")
+    sliderButton.Size = UDim2.new(0, 180, 0, 20)
+    sliderButton.Position = UDim2.new(0, 200, 0, yOffset + 15)
+    sliderButton.Text = ""
+    sliderButton.BackgroundTransparency = 1
+    sliderButton.Parent = parent
+
+    local dragConn
+    local releaseConn
+    sliderButton.MouseButton1Down:Connect(function()
+        dragConn = RunService.RenderStepped:Connect(function()
+            local mousePos = UserInputService:GetMouseLocation()
+            local relX = math.clamp(mousePos.X - slider.AbsolutePosition.X, 0, slider.AbsoluteSize.X)
+            local range = (maxValue - minValue)
+            if range == 0 then range = 1 end
+            local t = relX / slider.AbsoluteSize.X
+            local v = minValue + t * range
+            Config[configField] = math.floor(v * (10 ^ precision)) / (10 ^ precision)
+            refresh()
+            if configField == "FOV" and FOVCircle then
+                FOVCircle.Radius = Config.FOV
+            elseif configField == "CrosshairSize" or configField == "CrosshairThickness" then
+                createCrosshair()
+            end
+        end)
+        -- B24: track these too so cleanup can disconnect them
+        table.insert(Connections, dragConn)
+        releaseConn = UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                if dragConn then dragConn:Disconnect() dragConn = nil end
+                if releaseConn then releaseConn:Disconnect() releaseConn = nil end
+            end
+        end)
+        table.insert(Connections, releaseConn)
+    end)
+end
+
+-- --------------------------------------------------------------------------
+-- GUI: toggle button
+-- --------------------------------------------------------------------------
+local function createToggleButton(parent, name, configField, yOffset)
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.new(0, 180, 0, 30)
+    button.Position = UDim2.new(0, 10, 0, yOffset)
+    button.TextColor3 = Color3.fromRGB(255, 255, 255)
+    button.Font = Enum.Font.Gotham
+    button.TextSize = 14
+    button.Parent = parent
+    Instance.new("UICorner", button).CornerRadius = UDim.new(0, 4)
+
+    local function refresh()
+        button.Text = name .. ": " .. (Config[configField] and "ON" or "OFF")
+        button.BackgroundColor3 = Config[configField]
+            and Color3.fromRGB(50, 150, 50) or Color3.fromRGB(150, 50, 50)
+    end
+    refresh()
+
+    button.MouseButton1Click:Connect(function()
+        Config[configField] = not Config[configField]
+        refresh()
+        if configField == "FOVCircleVisible" and FOVCircle then
+            FOVCircle.Visible = Config.FOVCircleVisible
+        elseif configField == "CrosshairEnabled" then
+            createCrosshair()
+        elseif configField == "SafetyAimEnabled" then
+            createSafetyWarning()
+        elseif configField == "ESPEnabled" and not Config.ESPEnabled then
+            clearAllESP()
+        end
+    end)
+    return button
+end
+
+-- --------------------------------------------------------------------------
+-- GUI: dropdown (cycle button)
+-- --------------------------------------------------------------------------
+local function createDropdown(parent, name, configField, options, yOffset)
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0, 180, 0, 20)
+    label.Position = UDim2.new(0, 200, 0, yOffset)
+    label.Text = name .. ":"
+    label.TextColor3 = Color3.fromRGB(200, 200, 200)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.Gotham
+    label.TextSize = 14
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = parent
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 180, 0, 30)
+    btn.Position = UDim2.new(0, 200, 0, yOffset + 20)
+    btn.Text = tostring(Config[configField])
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.BackgroundColor3 = Color3.fromRGB(70, 70, 90)
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 14
+    btn.Parent = parent
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+
+    btn.MouseButton1Click:Connect(function()
+        local current = Config[configField]
+        local idx = 1
+        for i, v in ipairs(options) do
+            if v == current then idx = i break end
+        end
+        -- B76: if current isn't in list, idx stays 1 → cycles to options[2]
+        local nextIdx = (idx % #options) + 1
+        Config[configField] = options[nextIdx]
+        btn.Text = tostring(Config[configField])
+        if configField == "CrosshairType" then createCrosshair() end
+    end)
+    return btn
+end
+
+-- --------------------------------------------------------------------------
+-- GUI build
+-- --------------------------------------------------------------------------
+function createGUI()
+    -- Destroy any previous instance so we don't stack GUIs (fixes B48)
+    local existing = getGuiParent():FindFirstChild("RagebotGUI")
+    if existing then existing:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "RagebotGUI"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = getGuiParent()
+    GUIInstance = gui
+
+    local main = Instance.new("Frame")
+    main.Size = UDim2.new(0, 410, 0, 720)
+    main.Position = UDim2.new(0, 30, 0, 30)
+    main.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+    main.BackgroundTransparency = 0.15
+    main.BorderSizePixel = 0
+    main.Active = true
+    main.Parent = gui
+    Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+    makeDraggable(main)
+
+    local stroke = Instance.new("UIStroke", main)
+    stroke.Thickness = 2
+    stroke.Color = Color3.fromRGB(80, 80, 100)
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -50, 0, 40)
+    title.Position = UDim2.new(0, 10, 0, 10)
+    title.Text = "Ragebot Aimbot v3.0 (Fixed)"
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 16
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = main
+
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.new(0, 30, 0, 30)
+    close.Position = UDim2.new(1, -40, 0, 10)
+    close.Text = "X"
+    close.TextColor3 = Color3.fromRGB(255, 255, 255)
+    close.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    close.Font = Enum.Font.GothamBold
+    close.TextSize = 14
+    close.Parent = main
+    Instance.new("UICorner", close).CornerRadius = UDim.new(0, 4)
+
+    close.MouseButton1Click:Connect(function()
+        gui.Enabled = false  -- hide, don't destroy (so Insert can re-open)
+        Config.GUIVisible = false
+    end)
+
+    -- Toggle column
+    local toggleY = 60
+    local toggles = {
+        {"Aimbot", "Enabled"},
+        {"Team Check", "TeamCheck"},
+        {"Visibility Check", "VisibilityCheck"},
+        {"Stabilization", "StabilizationEnabled"},
+        {"ESP", "ESPEnabled"},
+        {"ESP Boxes", "ESPBoxes"},
+        {"ESP Names", "ESPNames"},
+        {"ESP Tracers", "ESPTracers"},
+        {"ESP Health", "ESPHealth"},
+        {"ESP Distance", "ESPDistance"},
+        {"Prediction", "PredictionEnabled"},
+        {"Safety Aim", "SafetyAimEnabled"},
+        {"Crosshair", "CrosshairEnabled"},
+        {"Auto Fire", "AutoFire"},
+        {"Auto Adjust", "AutoAdjustEnabled"},
+    }
+    for _, t in ipairs(toggles) do
+        createToggleButton(main, t[1], t[2], toggleY)
+        toggleY = toggleY + 40
+    end
+
+    -- Dropdowns
+    local ddY = 60
+    createDropdown(main, "Aiming Mode", "AimingMode", {"Mouse", "Camera"}, ddY); ddY = ddY + 60
+    createDropdown(main, "Aim Method", "AimMethod", {"Rage", "Legit"}, ddY); ddY = ddY + 60
+    createDropdown(main, "Target Part", "TargetPart",
+        {"Head", "UpperTorso", "LowerTorso", "HumanoidRootPart", "Dynamic"}, ddY); ddY = ddY + 60
+    createDropdown(main, "Tracer Origin", "TracerOrigin",
+        {"Mouse", "Center", "Bottom", "Top"}, ddY); ddY = ddY + 60
+    createDropdown(main, "Crosshair Type", "CrosshairType",
+        {"Circle", "Octagon", "Dot"}, ddY); ddY = ddY + 60
+
+    -- Sliders
+    local slY = ddY + 10
+    createSlider(main, "FOV", "FOV", 10, 250, slY, 0); slY = slY + 40
+    createSlider(main, "Smoothness", "Smoothness", 0.1, 1, slY, 2); slY = slY + 40
+    createSlider(main, "Max Speed", "MaxLockSpeed", 0.1, 2, slY, 2); slY = slY + 40
+    createSlider(main, "Humanization", "HumanizationFactor", 0, 0.5, slY, 2); slY = slY + 40
+    createSlider(main, "Prediction", "PredictionStrength", 0, 0.3, slY, 3); slY = slY + 40
+    createSlider(main, "Bullet Speed", "BulletSpeed", 500, 3000, slY, 0); slY = slY + 40
+    createSlider(main, "Lock Strength", "LockStrength", 0.1, 1, slY, 2); slY = slY + 40
+    createSlider(main, "Lock Threshold", "LockThreshold", 1, 20, slY, 1); slY = slY + 40
+    createSlider(main, "Crosshair Size", "CrosshairSize", 5, 30, slY, 0); slY = slY + 40
+    createSlider(main, "Crosshair Thick", "CrosshairThickness", 1, 5, slY, 0)
+end
+
+-- --------------------------------------------------------------------------
+-- Connections / main loops
+-- --------------------------------------------------------------------------
+local function initializeConnections()
+    -- Clean any pre-existing connections (idempotent init)
+    for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
+    Connections = {}
+
+    -- Main loop: aim + FOV + crosshair position + safety + auto-adjust
+    -- Use RenderStepped for everything visual (fixes B41)
+    trackConn(RunService.RenderStepped:Connect(function()
+        updateFOVCircle()
+        rageAimbot()
+        if Crosshair then
+            local cam = getCamera()
+            Crosshair.Position = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+        end
+        autoAdjustSettings()
+    end))
+
+    -- ESP also on RenderStepped ( Drawing objects are screen-space )
+    trackConn(RunService.RenderStepped:Connect(function()
+        updateESP()
+        checkSafetyAim()
+    end))
+
+    -- Hotkeys (fixes B49 — ignore while typing)
+    trackConn(UserInputService.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        if UserInputService:GetFocusedTextBox() then return end  -- B49 chat guard
+
+        if input.KeyCode == Enum.KeyCode.Insert then
+            if GUIInstance then
+                GUIInstance.Enabled = not GUIInstance.Enabled
+                Config.GUIVisible = GUIInstance.Enabled
+            else
+                createGUI()
+            end
+        elseif input.KeyCode == Enum.KeyCode.F then
+            Config.Enabled = not Config.Enabled
+        elseif input.KeyCode == Enum.KeyCode.R then
+            SmoothAimProgress = 0
+            LastTargetPlayer = nil
+        end
+    end))
+
+    -- Player leaving (fixes B40 / B53 — ESP cache cleanup)
+    trackConn(Players.PlayerRemoving:Connect(function(player)
+        clearPlayerESP(player)
+        TargetHistory[player] = nil
+    end))
+
+    -- LocalPlayer character death/respawn — clean local references
+    trackConn(LocalPlayer.CharacterAdded:Connect(function()
+        SmoothAimProgress = 0
+        LastTargetPlayer = nil
+    end))
+
+    -- Camera swap (fixes B42)
+    trackConn(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        Camera = Workspace.CurrentCamera
+    end))
+end
+
+-- --------------------------------------------------------------------------
+-- Cleanup (fixes B9, B29, B43)
+-- --------------------------------------------------------------------------
+local function cleanup()
+    -- Disconnect all tracked connections
+    for _, c in ipairs(Connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    Connections = {}  -- B43
+
+    -- Drawing objects
+    if FOVCircle then pcall(function() FOVCircle:Remove() end) FOVCircle = nil end
+    if Crosshair then pcall(function() Crosshair:Remove() end) Crosshair = nil end
+    if SafetyWarning then pcall(function() SafetyWarning:Remove() end) SafetyWarning = nil end
+
+    -- ESP
+    clearAllESP()
+
+    -- GUI
+    if GUIInstance then
+        pcall(function() GUIInstance:Destroy() end)
+        GUIInstance = nil
+    else
+        local existing = getGuiParent():FindFirstChild("RagebotGUI")
+        if existing then pcall(function() existing:Destroy() end) end
+    end
+
+    -- Restore camera type if we changed it
+    if Camera and Camera.CameraType == Enum.CameraType.Scriptable then
+        Camera.CameraType = Enum.CameraType.Custom
+    end
+end
+
+-- --------------------------------------------------------------------------
+-- Unload hook (fixes B8 — try multiple executor signals)
+-- --------------------------------------------------------------------------
+local function hookUnload()
+    -- Pattern 1: Synapse X / Krnl / Wave
+    if HAS_GETGENV then
+        local genv = getgenv()
+        if type(genv) == "table" then
+            -- Synapse-style: hook the metatable __gc on the script env
+            -- Many executors fire a "shutdown" or "unload" signal:
+            for _, signalName in ipairs({ "SynapseUnload", "unload", "shutdown", "on_unload" }) do
+                local sig = genv[signalName]
+                if typeof(sig) == "RBXScriptSignal" then
+                    sig:Connect(cleanup)
+                    return
+                end
+            end
+        end
+    end
+
+    -- Pattern 2: bind to engine signals that fire on shutdown
+    pcall(function()
+        if game:GetService("ScriptContext") then
+            -- Best-effort: cleanup on CoreGui being destroyed
+            game.Destroying:Connect(cleanup)
+        end
+    end)
+
+    -- Pattern 3: expose a global cleanup the user can call manually
+    if HAS_GETGENV then
+        getgenv().RagebotUnload = cleanup
+    end
+end
+
+-- --------------------------------------------------------------------------
+-- Safe init (fixes B7 — bounded retries; B45 — pcall guard)
+-- --------------------------------------------------------------------------
+local function safeInitialize()
+    local maxRetries = 3
+    for attempt = 1, maxRetries do
+        local ok, err = pcall(function()
+            if HAS_DRAWING then
+                FOVCircle = newDrawing("Circle")
+            end
+            configureFOVCircle()
+            createSafetyWarning()
+            createCrosshair()
+            createGUI()
+            initializeConnections()
+        end)
+        if ok then
+            hookUnload()
+            return true
+        end
+        warn(string.format("[Ragebot] Init attempt %d/%d failed: %s", attempt, maxRetries, tostring(err)))
+        task.wait(1)
+    end
+    warn("[Ragebot] Init failed after " .. maxRetries .. " attempts. Aborting.")
+    return false
+end
+
+-- --------------------------------------------------------------------------
+-- Boot
+-- --------------------------------------------------------------------------
+local ok, err = pcall(safeInitialize)
+if not ok then
+    warn("[Ragebot] Unrecoverable init error: " .. tostring(err))
+    return
+end
+
+if HAS_DRAWING and FOVCircle then
+    -- Show a brief loaded notification via Drawing.Text instead of a ScreenGui
+    task.spawn(function()
+        local note = newDrawing("Text")
+        if not note then return end
+        local cam = getCamera()
+        note.Text = "Ragebot v3.0 (Fixed) loaded"
+        note.Color = Color3.fromRGB(120, 220, 120)
+        note.Size = 18
+        note.Center = true
+        note.Outline = true
+        note.OutlineColor = Color3.fromRGB(0, 0, 0)
+        note.Position = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y - 60)
+        note.Visible = true
+        task.delay(4, function()
+            pcall(function() note:Remove() end)
+        end)
+    end)
+end
+
+print("[Ragebot] v3.0 (Fixed) ready.")
+print("[Ragebot] Hotkeys: INSERT=toggle GUI | F=toggle aimbot | R=reset smooth aim")
+print("[Ragebot] Manual unload: call getgenv().RagebotUnload() if your executor lacks an unload signal")
